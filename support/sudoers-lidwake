@@ -1,0 +1,5 @@
+# lidwake: let USERNAME toggle SleepDisabled without a password.
+# Replace USERNAME with the installing user, check with `visudo -cf`, install as
+# /etc/sudoers.d/lidwake (owner root:wheel, mode 0440). See README.md.
+USERNAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+USERNAME ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1

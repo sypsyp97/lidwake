@@ -1,0 +1,20 @@
+----------------------------- MODULE Lidwake_bug -----------------------------
+(***************************************************************************)
+(* Mutation check. Same model as Lidwake; the cfg selects one seeded bug   *)
+(* through the constant Mutation. Each bug must be caught:                 *)
+(*   "saveAfterPmset"    owned=true saved after pmset 1  -> NoOrphanHold    *)
+(*   "startDropsOwned"   start() drops owned (old rule)  -> NoOrphanHold    *)
+(*   "noOrphanGuard"     no isAlive(pending) check       -> NoOrphanHold    *)
+(*   "recordAfterResume" pending saved after the child   *)
+(*                       is resumed                      -> NoOrphanHold    *)
+(*   "nilClaims"         a nil read claims the flag      -> NeverClobberUser *)
+(*   "clearUnowned"      !hold clears when not owned     -> NeverClobberUser *)
+(*   "dropOwnedOnFail"   failed pmset 0 => owned=false   -> EventuallyRestored *)
+(*   "noKillStopped"     a stopped pending child is not  *)
+(*                       killed                          -> EventuallyRestored *)
+(*   "noAssertOnFail"    failed enable skips assertion   -> AssertionIffHold *)
+(*   "typeOverflow"      settle counter set to S+1       -> TypeOK          *)
+(* check.sh generates one cfg per bug; Lidwake_bug.cfg is the first one.  *)
+(***************************************************************************)
+EXTENDS Lidwake
+=============================================================================
