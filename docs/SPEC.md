@@ -31,6 +31,7 @@ public enum Decision {
 }
 ```
 Rules, in order:
+0. Clock moved back: if `lastActive > now`, the rules below use `now` in its place, and every Outcome returns `now` where a rule says "lastActive unchanged". So a stored time in the future never extends the settle window beyond `settle` seconds after `now`, and the corrected value is what the Controller saves. `lastActive <= now` and nil are used as given.
 1. batteryLow = `power.onBattery && (chargePercent == nil || chargePercent! < 20)`. If batteryLow: `hold=false, reason=.batteryLow`; lastActive unchanged. Battery low overrides everything, including forced.
 2. active = forced || herdrWorking == true || backgroundTask. Reason priority when active: forced > herdrWorking > backgroundTask. Active ⇒ `hold=true`, `lastActive=now`.
 3. Not active, lastActive != nil and `now - lastActive < settle` ⇒ `hold=true, reason=.settling`, lastActive unchanged.
@@ -99,12 +100,18 @@ public final class PowerAssertion: AssertionHolder { public init(name: String) }
 ## 7. Journal (state persisted across crashes)
 ```swift
 public struct Journal: Codable, Equatable, Sendable { public var owned: Bool; public var lastActive: Date?; public var pending: ProcessIdentity?; public init(owned: Bool = false, lastActive: Date? = nil, pending: ProcessIdentity? = nil) }
+public enum JournalState: Equatable, Sendable { case missing, valid(Journal), unreadable }
 public struct JournalStore: Sendable {
     public init(directory: URL)            // creates directory if needed; file "journal.json"
-    public func load() -> Journal          // missing or corrupt file ⇒ Journal() (owned=false)
-    public func save(_ j: Journal) throws  // atomic: write temp file, fsync it, rename over journal.json; never leaves a partial or temp file
+    public func inspect() -> JournalState  // read only: never creates, renames, writes or deletes a file
+    public func load() -> Journal          // caller holds the instance lock; rules below
+    public func save(_ j: Journal) throws  // atomic: write temp file "journal.json.tmp-<unique>", fsync it, rename over journal.json; a failed save removes its temp file
+    public func removeStaleTemporaryFiles() // caller holds the instance lock; rules below
 }
 ```
+- `inspect`: no file ⇒ `.missing`; file read and decoded ⇒ `.valid(journal)`; any other read or decode error ⇒ `.unreadable`.
+- `load` (revision 5): `.missing` ⇒ `Journal()`. `.valid(j)` ⇒ `j`. `.unreadable` ⇒ (a) copy the exact bytes of journal.json to a new file in the same directory named `journal.json.corrupt-<UTC time of the copy as yyyyMMdd'T'HHmmss'Z'>-<unique part>`, so names sort by time (an existing copy is never overwritten); (b) only if (a) succeeded, save `Journal(owned: true)` (lastActive nil, pending nil) over journal.json; (c) return `Journal(owned: true)`, also when (a) or (b) failed (each failure logged; a failed copy leaves journal.json as it was at this load, and a later save replaces it). Reason: lidwake cannot tell whether it set `SleepDisabled=1`. Loading as owned keeps the idle and low-battery restore working; the cost is that a user's own `disablesleep 1` can be cleared once (TLA+ group `corrupt`).
+- A crash (SIGKILL, power loss) between creating the temp file and the rename can leave `journal.json.tmp-*` files. `removeStaleTemporaryFiles` deletes every file in the directory whose name starts with `journal.json.tmp-` and nothing else (journal.json, `journal.json.corrupt-*`, lock, force and unrelated files stay); failures are logged, never thrown. Only a holder of the instance lock may call it, because a lock holder is the only writer: `status`, `on` and `off` never call `load` or `removeStaleTemporaryFiles`.
 `owned == true` means lidwake set `SleepDisabled=1` and has not restored it yet. `pending` = the privileged pmset child that may still be running (recorded before it is resumed). A journal written by an older version without `pending` loads with pending=nil.
 
 ## 8. Controller (orchestration, injected dependencies)
@@ -120,7 +127,7 @@ public final class Controller {
 - Every `setSleepDisabled` call goes through one path: its `recorded` callback saves `pending = identity` (with the owned value the step requires) BEFORE the child runs; after the call returns or throws, `pending = nil` is saved together with the outcome.
 - Stopped orphan: a pending child that is `.stopped` was never resumed (crash between record and SIGCONT) and never ran pmset ⇒ the controller calls `probe.kill(pending)` and treats it like a running orphan until the probe reports `.gone`.
 - Orphan guard (TLA+ WaitForOrphans): while `journal.pending != nil && probe.state(pending) != .gone`, the controller makes NO `setSleepDisabled` call (start, tick, stop). The assertion still follows hold. When the probe reports it gone, `pending = nil` is saved and normal rules apply from that tick. Reason: a pmset child of a crashed run can land after a later successful clear.
-- `start`: load journal. If `owned`: keep owned=true and `lastActive` as they are, whatever `isSleepDisabled()` returns (a crashed run's pmset child may still land; ownership is only dropped after a successful `setSleepDisabled(false)`). If not owned: nothing.
+- `start`: `store.removeStaleTemporaryFiles()`, then `store.load()` (§7: an unreadable journal loads as owned). If `owned`: keep owned=true and `lastActive` as they are, whatever `isSleepDisabled()` returns (a crashed run's pmset child may still land; ownership is only dropped after a successful `setSleepDisabled(false)`). If not owned: nothing.
 - `tick`: evaluate Decision with journal.lastActive; save new lastActive.
   - hold && !owned: read `isSleepDisabled()`. `true` (set by the user, not us) ⇒ do not touch it, owned stays false. `nil` (unreadable) ⇒ do not claim; retry next tick. `false` ⇒ write-ahead: save owned=true FIRST, then `setSleepDisabled(true)`; on throw revert to owned=false and save (retry next tick).
   - hold && owned: if `isSleepDisabled() == false` (e.g. crash between write-ahead and pmset) ⇒ `setSleepDisabled(true)` again; throw ⇒ retry next tick. `true` or `nil` ⇒ no call.
@@ -128,6 +135,7 @@ public final class Controller {
   - !hold && !owned: no call.
   - Never sets SleepDisabled=false unless owned.
 - `stop`: if owned ⇒ `setSleepDisabled(false)`; success ⇒ owned=false and save; throw ⇒ owned stays true on disk (next start/tick retries), log. Always release assertion. Idempotent.
+- Known limitation (TLA+ `corrupt-limitation-pending`): if journal.json becomes unreadable while it records a pmset child (`pending != nil`), the child's identity is lost with it. The orphan guard then cannot wait for that child, and a late `pmset 1` from it can land after lidwake cleared the flag. The window is the run time of one pmset child.
 - Known limitation: if the user manually runs `pmset -a disablesleep 1` while lidwake owns the flag, lidwake cannot tell the two apart and clears it when idle. While lidwake does not own the flag, a user setting is never touched.
 - The assertion is held iff the last outcome had hold=true, independent of whether setSleepDisabled succeeded (a failed enable still holds the assertion).
 
@@ -142,8 +150,11 @@ public enum CommandError: Error, Equatable { case usage(String) }
 - Single instance: `run` and `restore` take an exclusive non-blocking `flock` on `<stateDir>/lock` (fd opened O_CLOEXEC so spawned children never inherit it; file kept, never unlinked; lock held for the process lifetime, released by the kernel on exit/crash). Lock held by another process ⇒ stderr message, exit 75, nothing read or changed. `on`/`off`/`status` do not lock. A `run --dry-run` uses its own state (`<stateDir>/dry-run/`) and its own lock there, so it never blocks or is blocked by the real agent.
 - `on` creates `<stateDir>/force`, `off` removes it (idempotent). Forced = file exists. State dir `~/.lidwake` (overridable by env `LIDWAKE_STATE_DIR`).
 - `run`: Controller loop on a DispatchSourceTimer (leeway 5 s); SIGTERM/SIGINT ⇒ `stop()` then exit 0. One reused TaskFileScanner/HerdrClient instance; no per-tick unbounded allocations.
-- `restore`: if `pending` is `.stopped` ⇒ kill it first, then poll `state` every 10 ms for up to 2 s until `.gone` (SIGKILL and reaping are asynchronous); if `pending` is still not `.gone` ⇒ stderr "pmset still running", exit 75, nothing changed. Else only if journal owned: `setSleepDisabled(false)`; success ⇒ owned=false, exit 0; throw ⇒ owned stays true, message on stderr, exit 1. Not owned ⇒ exit 0, nothing changed.
+- `restore`: after taking the lock, `removeStaleTemporaryFiles()` then `load()` (§7: an unreadable journal is copied aside and loads as owned, so `restore` then clears the flag). If `pending` is `.stopped` ⇒ kill it first, then poll `state` every 10 ms for up to 2 s until `.gone` (SIGKILL and reaping are asynchronous); if `pending` is still not `.gone` ⇒ stderr "pmset still running", exit 75, nothing changed. Else only if journal owned: `setSleepDisabled(false)`; success ⇒ owned=false, exit 0; throw ⇒ owned stays true, message on stderr, exit 1. Not owned ⇒ exit 0, nothing changed.
+- `status`: prints the inputs, the flag, the journal and the decision; it never writes or deletes a file. The journal comes from `inspect()`: `.missing` prints as `Journal()`; `.unreadable` prints a journal line that contains `unreadable` and says the next `run` or `restore` keeps a copy and treats `SleepDisabled` as owned; the decision then uses lastActive = nil.
+  When `<stateDir>` holds files named `journal.json.corrupt-*`, `status` prints one more line `kept unreadable journals: <n> (<names sorted, comma-separated>)`; with none, it prints no such line. It lists names only; it never reads, moves or deletes those files. So the event stays visible after a `run` or `restore` has replaced the unreadable journal.
 - Logging via `os.Logger(subsystem: "dev.lidwake", category: ...)` on state changes and errors.
+- Not supported: two non-dry `run` instances with different state directories (`LIDWAKE_STATE_DIR`). The lock is per state directory, but `SleepDisabled` is one machine-wide flag; two journals would each claim and clear it.
 
 ## 10. Deliverables outside Swift
 - `support/com.lidwake.agent.plist` (LaunchAgent: `lidwake run`, KeepAlive true, RunAtLoad true).

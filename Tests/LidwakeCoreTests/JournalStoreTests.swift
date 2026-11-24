@@ -49,14 +49,14 @@ extension LidwakeTests {
         }
 
         @Test(
-            "corrupt file loads default",
+            "corrupt file loads as owned",
             arguments: ["", "not json", "{", #"{"owned":"#, "[1,2,3]", #"{"owned":"yes"}"#]
         )
-        func corruptFileLoadsDefault(contents: String) throws {
+        func corruptFileLoadsAsOwned(contents: String) throws {
             let dir = try TempPaths.makeDirectory("journal")
             defer { TempPaths.remove(dir) }
             try Data(contents.utf8).write(to: dir.appendingPathComponent("journal.json"))
-            #expect(JournalStore(directory: dir).load() == Journal())
+            #expect(JournalStore(directory: dir).load() == Journal(owned: true))
         }
 
         @Test func initCreatesMissingDirectory() throws {

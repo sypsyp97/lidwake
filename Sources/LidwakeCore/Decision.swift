@@ -50,6 +50,9 @@ public enum Decision {
   public static func evaluate(
     _ inputs: Inputs, now: Date, lastActive: Date?, settle: TimeInterval = defaultSettle
   ) -> Outcome {
+    // Rule 0: a stored time after `now` (clock moved back) counts as `now`, so it never
+    // extends the settle window and the corrected value is returned.
+    let lastActive = lastActive.map { min($0, now) }
     let power = inputs.power
     if power.onBattery, (power.chargePercent ?? 0) < lowBatteryPercent {
       return Outcome(hold: false, reason: .batteryLow, lastActive: lastActive)

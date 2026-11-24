@@ -68,7 +68,7 @@ extension LidwakeTests {
             let out = Decision.evaluate(inputs, now: Self.now, lastActive: last)
             #expect(out.hold == true)
             #expect(out.reason == .settling)
-            #expect(out.lastActive == last)
+            #expect(out.lastActive == min(last, Self.now))
         }
 
         @Test(

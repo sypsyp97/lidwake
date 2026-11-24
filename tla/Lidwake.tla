@@ -3,7 +3,9 @@
 (* Model of the lidwake Controller protocol, written from docs/SPEC.md      *)
 (* sections 6 (SleepControl), 7 (Journal), 8 (Controller) and 9 (run/stop/ *)
 (* restore), as amended in commits 6fff56b (orphan guard) and 2b0ce82     *)
-(* (kill stopped orphans). No implementation code was consulted.           *)
+(* (kill stopped orphans), and by revision 5: an unreadable journal is     *)
+(* kept as a copy and loaded as owned. No implementation code was          *)
+(* consulted.                                                              *)
 (*                                                                         *)
 (* Every step that touches the disk (journal save), pmset, the IORegistry  *)
 (* read or the process probe is its own atomic action, so a crash, a user  *)
@@ -24,7 +26,9 @@ CONSTANTS
     UserRace,   \* TRUE: the user may run `pmset disablesleep 1` at any instant.
                 \* FALSE: only while lidwake holds no claim on the flag (Quiet);
                 \* SPEC 8 "Known limitation".
-    Mutation    \* "none" or the name of one seeded bug (see Lidwake_bug.tla)
+    Mutation,   \* "none" or the name of one seeded bug (see Lidwake_bug.tla)
+    Corruption, \* TRUE: journal.json can become unreadable on disk (SPEC 7)
+    CorruptWithPending \* TRUE: also while it records a pmset child (limitation)
 
 VARIABLES
     sd,          \* system flag SleepDisabled (IOPMrootDomain)
@@ -32,6 +36,7 @@ VARIABLES
     jOwned,      \* journal.json on disk: owned
     jSettle,     \* journal.json on disk: lastActive, as remaining settle ticks 0..S
     jPend,       \* journal.json on disk: pending child identity, 0 = nil
+    jBad,        \* journal.json on disk cannot be read or decoded
     pc,          \* agent program counter; "down" = process not running
     memOwned,    \* agent in-memory journal: owned
     memS,        \* agent in-memory journal: lastActive (remaining settle ticks)
@@ -54,25 +59,25 @@ VARIABLES
     rpc,         \* `lidwake restore` program counter; "none" = not running
     calm         \* environment has gone quiet for good (liveness hypothesis)
 
-vars == <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend, hold,
+vars == <<sd, userSet, jOwned, jSettle, jPend, jBad, pc, memOwned, memS, memPend, hold,
           assertHeld, termPending, caller, active, battLow, child, childPh, childId,
           childRes, nextId, orphans, rpc, calm>>
 
 Ids == {1, 2}
 Vals == {"on", "off"}
 OPhases == {"stopped", "running", "dying"}
-PCs == {"down", "s_load",
+PCs == {"down", "s_load", "s_quar",
         "idle", "t_saveLA", "t_probe", "t_pendClear",
         "t_kill", "t_read", "t_wal", "t_readOwned", "t_assert",
         "c_spawn", "c_record", "c_resume", "c_record2", "c_wait", "c_save",
         "p_probe", "p_kill", "p_pendClear", "p_release"}
-RPCs == {"none", "r_load", "r_probe", "r_kill", "r_spawn", "r_record", "r_resume", "r_record2",
+RPCs == {"none", "r_load", "r_quar", "r_probe", "r_kill", "r_spawn", "r_record", "r_resume", "r_record2",
          "r_wait", "r_saveOk", "r_saveFail"}
 Callers == {"none", "en", "re", "off", "stop"}
 
 TypeOK ==
     /\ sd \in BOOLEAN /\ userSet \in BOOLEAN
-    /\ jOwned \in BOOLEAN /\ jSettle \in 0..S /\ jPend \in {0} \cup Ids
+    /\ jOwned \in BOOLEAN /\ jSettle \in 0..S /\ jPend \in {0} \cup Ids /\ jBad \in BOOLEAN
     /\ pc \in PCs /\ memOwned \in BOOLEAN /\ memS \in 0..S /\ memPend \in {0} \cup Ids
     /\ hold \in BOOLEAN /\ assertHeld \in BOOLEAN /\ termPending \in BOOLEAN
     /\ caller \in Callers /\ active \in BOOLEAN /\ battLow \in BOOLEAN
@@ -83,7 +88,7 @@ TypeOK ==
 
 Init ==
     /\ sd \in BOOLEAN /\ userSet = sd
-    /\ jOwned = FALSE /\ jSettle = 0 /\ jPend = 0
+    /\ jOwned = FALSE /\ jSettle = 0 /\ jPend = 0 /\ jBad = FALSE
     /\ pc = "down" /\ memOwned = FALSE /\ memS = 0 /\ memPend = 0
     /\ hold = FALSE /\ assertHeld = FALSE /\ termPending = FALSE /\ caller = "none"
     /\ active \in BOOLEAN /\ battLow \in BOOLEAN
@@ -91,8 +96,16 @@ Init ==
     /\ nextId = 1 /\ orphans = {}
     /\ rpc = "none" /\ calm = FALSE
 
-\* JournalStore.save of the agent's in-memory journal: one atomic rename.
-Save == jOwned' = memOwned /\ jSettle' = memS /\ jPend' = memPend
+\* JournalStore.save of the agent's in-memory journal: one atomic rename. It
+\* replaces an unreadable journal.
+Save == jOwned' = memOwned /\ jSettle' = memS /\ jPend' = memPend /\ jBad' = FALSE
+
+\* An unreadable journal is loaded as owned (SPEC 7 revision 5). Mutant
+\* "corruptAsUnowned" keeps the rule before revision 5: loaded as Journal().
+AssumeOwned == Mutation # "corruptAsUnowned"
+
+\* What a load concludes about ownership from the disk.
+DiskOwned == IF jBad THEN AssumeOwned ELSE jOwned
 
 \* ProcessProbe.state(id): "gone" | "running" | "stopped". Only children of a
 \* dead parent can be probed (own children are waited for). A SIGKILLed child
@@ -134,34 +147,48 @@ BranchCaller == IF ~hold /\ (memOwned \/ Mutation = "clearUnowned") THEN "off" E
 (***************************************************************************)
 ToggleActive ==
     /\ ~calm /\ active' = ~active
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 ToggleBatt ==
     /\ battLow' = ~battLow
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, child, childPh,
                       childId, childRes, nextId, orphans, rpc, calm>>
 BecomeCalm ==
     /\ ~calm /\ calm' = TRUE /\ active' = FALSE
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc>>
 UserOn ==
     /\ ~calm /\ (UserRace \/ Quiet) /\ sd' = TRUE /\ userSet' = TRUE
-    /\ UNCHANGED <<jOwned, jSettle, jPend, pc, memOwned, memS, memPend, hold,
+    /\ UNCHANGED <<jBad, jOwned, jSettle, jPend, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 UserOff ==
     /\ ~calm /\ sd' = FALSE /\ userSet' = FALSE
-    /\ UNCHANGED <<jOwned, jSettle, jPend, pc, memOwned, memS, memPend, hold,
+    /\ UNCHANGED <<jBad, jOwned, jSettle, jPend, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 SigTerm ==
     /\ ~calm /\ pc # "down" /\ ~termPending /\ termPending' = TRUE
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, caller, active, battLow, child, childPh,
                       childId, childRes, nextId, orphans, rpc, calm>>
+
+\* journal.json becomes unreadable (disk error, foreign writer, downgrade).
+\* Not while `restore` runs: restore keeps its loaded journal in memory and
+\* overwrites the disk at its next save, so a corruption during restore acts
+\* like one right after restore ends. Base: only while no pmset child is
+\* recorded (CorruptWithPending = FALSE); the identity of a recorded child
+\* would be lost with the journal.
+Corrupt ==
+    /\ Corruption /\ ~calm /\ ~jBad /\ rpc = "none"
+    /\ (jPend = 0 \/ CorruptWithPending)
+    /\ jBad' = TRUE
+    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+                      hold, assertHeld, termPending, caller, active, battLow, child,
+                      childPh, childId, childRes, nextId, orphans, rpc, calm>>
 
 \* The parent of the live child dies. A child still suspended and not
 \* recorded never runs (no flag effect, never probed). A recorded child that
@@ -178,7 +205,7 @@ KillChild ==
 Crash ==
     /\ ~calm /\ pc # "down" /\ pc' = "down" /\ assertHeld' = FALSE
     /\ caller' = "none" /\ KillChild
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, termPending, active, battLow, nextId, rpc, calm>>
 
 \* launchd KeepAlive restarts the agent; new process, fresh memory.
@@ -186,7 +213,7 @@ Restart ==
     /\ pc = "down" /\ rpc = "none" /\ pc' = "s_load"
     /\ memOwned' = FALSE /\ memS' = 0 /\ memPend' = 0 /\ hold' = FALSE
     /\ assertHeld' = FALSE /\ termPending' = FALSE
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, caller, active, battLow,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, caller, active, battLow,
                       child, childPh, childId, childRes, nextId, orphans, rpc, calm>>
 
 (***************************************************************************)
@@ -195,30 +222,30 @@ Restart ==
 ChildOk ==
     /\ child # "none" /\ childPh = "run"
     /\ sd' = (child = "on") /\ child' = "none" /\ childPh' = "none" /\ childRes' = "ok"
-    /\ UNCHANGED <<userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow,
                       childId, nextId, orphans, rpc, calm>>
 ChildFail ==
     /\ ~calm /\ child # "none" /\ childPh = "run"
     /\ child' = "none" /\ childPh' = "none" /\ childRes' = "fail"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow,
                       childId, nextId, orphans, rpc, calm>>
 \* A running orphan exits; a stopped orphan never runs by itself.
 OrphanOk ==
     /\ \E o \in orphans : o[3] = "running" /\ sd' = (o[2] = "on") /\ orphans' = orphans \ {o}
-    /\ UNCHANGED <<userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, rpc, calm>>
 OrphanFail ==
     /\ ~calm /\ \E o \in orphans : o[3] = "running" /\ orphans' = orphans \ {o}
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, rpc, calm>>
 \* A SIGKILLed stopped orphan is reaped (launchd); it never ran pmset.
 OrphanReap ==
     /\ \E o \in orphans : o[3] = "dying" /\ orphans' = orphans \ {o}
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, rpc, calm>>
 
@@ -227,11 +254,22 @@ OrphanReap ==
 (* pending. No flag read, no save, no pmset call.                          *)
 (***************************************************************************)
 SLoad ==
-    /\ pc = "s_load" /\ pc' = "idle"
-    /\ memOwned' = IF Mutation = "startDropsOwned" THEN FALSE ELSE jOwned
-    /\ jOwned' = IF Mutation = "startDropsOwned" THEN FALSE ELSE jOwned
-    /\ memS' = jSettle /\ memPend' = jPend
-    /\ UNCHANGED <<sd, userSet, jSettle, jPend, hold, assertHeld, termPending,
+    /\ pc = "s_load"
+    /\ IF jBad
+       THEN \* unreadable: keep a copy, then (revision 5) save it as owned
+            /\ memOwned' = AssumeOwned /\ memS' = 0 /\ memPend' = 0
+            /\ pc' = IF AssumeOwned THEN "s_quar" ELSE "idle"
+            /\ UNCHANGED jOwned
+       ELSE /\ memOwned' = IF Mutation = "startDropsOwned" THEN FALSE ELSE jOwned
+            /\ jOwned' = IF Mutation = "startDropsOwned" THEN FALSE ELSE jOwned
+            /\ memS' = jSettle /\ memPend' = jPend /\ pc' = "idle"
+    /\ UNCHANGED <<jBad, sd, userSet, jSettle, jPend, hold, assertHeld, termPending,
+                      caller, active, battLow, child, childPh, childId, childRes,
+                      nextId, orphans, rpc, calm>>
+\* save Journal(owned: true) over the unreadable journal (its copy is kept)
+SQuar ==
+    /\ pc = "s_quar" /\ Save /\ pc' = "idle"
+    /\ UNCHANGED <<sd, userSet, memOwned, memS, memPend, hold, assertHeld, termPending,
                       caller, active, battLow, child, childPh, childId, childRes,
                       nextId, orphans, rpc, calm>>
 
@@ -245,7 +283,7 @@ Eval ==
                ELSE IF active THEN (IF Mutation = "typeOverflow" THEN S + 1 ELSE S)
                ELSE IF memS > 0 THEN memS - 1 ELSE 0
     /\ pc' = "t_saveLA"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memPend,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 \* save new lastActive; then the orphan guard, then branch on (hold, owned).
@@ -265,12 +303,12 @@ TProbe ==
        [] ProbeState(memPend) = "stopped" /\ KillStopped
             -> pc' = "t_kill" /\ UNCHANGED memPend
        [] OTHER -> pc' = "t_assert" /\ UNCHANGED memPend
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, hold,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 TKill ==
     /\ pc = "t_kill" /\ KillOrphan(memPend) /\ pc' = "t_assert"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, rpc, calm>>
 TPendClear ==
@@ -288,7 +326,7 @@ TRead ==
                THEN pc' = "c_spawn" /\ UNCHANGED memOwned
                ELSE pc' = "t_wal" /\ memOwned' = TRUE
        ELSE pc' = "t_assert" /\ UNCHANGED <<memOwned, caller>>
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memS, memPend, hold,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memS, memPend, hold,
                       assertHeld, termPending, active, battLow, child, childPh,
                       childId, childRes, nextId, orphans, rpc, calm>>
 \* write-ahead: save owned=true FIRST
@@ -303,13 +341,13 @@ TReadOwned ==
     /\ \E seen \in ReadResults :
        IF seen = "false" THEN pc' = "c_spawn" /\ caller' = "re"
        ELSE pc' = "t_assert" /\ UNCHANGED caller
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 \* assertion held iff the last outcome had hold=true (SPEC 8, last bullet)
 TAssert ==
     /\ pc = "t_assert" /\ assertHeld' = hold /\ pc' = "idle" /\ caller' = "none"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, termPending, active, battLow, child, childPh, childId,
                       childRes, nextId, orphans, rpc, calm>>
 
@@ -323,13 +361,13 @@ CSpawn ==
     /\ child' = CallVal /\ childPh' = "susp" /\ childId' = nextId
     /\ nextId' = IF nextId = 1 THEN 2 ELSE 1
     /\ pc' = IF Mutation = "recordAfterResume" THEN "c_resume" ELSE "c_record"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow,
                       childRes, orphans, rpc, calm>>
 \* `recorded`: save pending = identity (with the owned value of this step)
 CRecord ==
     /\ pc = "c_record" /\ memPend' = childId
-    /\ jPend' = childId /\ jOwned' = memOwned /\ jSettle' = memS
+    /\ jBad' = FALSE /\ /\ jPend' = childId /\ jOwned' = memOwned /\ jSettle' = memS
     /\ childPh' = "rec" /\ pc' = "c_resume"
     /\ UNCHANGED <<sd, userSet, memOwned, memS, hold, assertHeld, termPending,
                       caller, active, battLow, child, childId, childRes, nextId,
@@ -337,13 +375,13 @@ CRecord ==
 CResume ==
     /\ pc = "c_resume" /\ childPh' = "run"
     /\ pc' = IF Mutation = "recordAfterResume" THEN "c_record2" ELSE "c_wait"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childId, childRes, nextId, orphans, rpc, calm>>
 \* mutant "recordAfterResume" only: the record save after the child runs
 CRecord2 ==
     /\ pc = "c_record2" /\ memPend' = childId
-    /\ jPend' = childId /\ jOwned' = memOwned /\ jSettle' = memS
+    /\ jBad' = FALSE /\ /\ jPend' = childId /\ jOwned' = memOwned /\ jSettle' = memS
     /\ pc' = "c_wait"
     /\ UNCHANGED <<sd, userSet, memOwned, memS, hold, assertHeld, termPending,
                       caller, active, battLow, child, childPh, childId, childRes,
@@ -362,7 +400,7 @@ CWait ==
                 THEN FALSE ELSE memOwned                    \* throw: owned stays true
            [] OTHER -> memOwned                             \* "re": owned stays true
     /\ pc' = "c_save"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memS, hold, assertHeld,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memS, hold, assertHeld,
                       termPending, caller, active, battLow, child, childPh, nextId,
                       orphans, rpc, calm>>
 CSave ==
@@ -383,7 +421,7 @@ PBegin ==
              [] memPend # 0 /\ Guard -> "p_probe"
              [] OTHER -> "c_spawn"
     /\ caller' = "stop"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 \* pending not gone => no call, owned stays true on disk
@@ -393,12 +431,12 @@ PProbe ==
        [] ProbeState(memPend) = "stopped" /\ KillStopped
             -> pc' = "p_kill" /\ UNCHANGED memPend
        [] OTHER -> pc' = "p_release" /\ UNCHANGED memPend
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, hold,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, rpc, calm>>
 PKill ==
     /\ pc = "p_kill" /\ KillOrphan(memPend) /\ pc' = "p_release"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, rpc, calm>>
 PPendClear ==
@@ -408,7 +446,7 @@ PPendClear ==
                       childRes, nextId, orphans, rpc, calm>>
 PRelease ==
     /\ pc = "p_release" /\ assertHeld' = FALSE /\ pc' = "down" /\ caller' = "none"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, memOwned, memS, memPend,
                       hold, termPending, active, battLow, child, childPh, childId,
                       childRes, nextId, orphans, rpc, calm>>
 
@@ -422,29 +460,37 @@ PRelease ==
 (***************************************************************************)
 RStart ==
     /\ ~calm /\ pc = "down" /\ rpc = "none" /\ rpc' = "r_load"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
 RLoad ==
     /\ rpc = "r_load"
-    /\ rpc' = CASE jPend # 0 /\ Guard -> "r_probe"
+    /\ rpc' = CASE jBad -> IF AssumeOwned THEN "r_quar" ELSE "none"
+              [] jPend # 0 /\ Guard -> "r_probe"
               [] jOwned -> "r_spawn"
               [] OTHER -> "none"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
+\* unreadable journal: save Journal(owned: true), then clear as owned
+RQuar ==
+    /\ rpc = "r_quar" /\ jOwned' = TRUE /\ jSettle' = 0 /\ jPend' = 0 /\ jBad' = FALSE
+    /\ rpc' = "r_spawn"
+    /\ UNCHANGED <<sd, userSet, pc, memOwned, memS, memPend, hold, assertHeld,
+                      termPending, caller, active, battLow, child, childPh, childId,
+                      childRes, nextId, orphans, calm>>
 RProbe ==
     /\ rpc = "r_probe"
     /\ rpc' = CASE ProbeState(jPend) = "gone" -> IF jOwned THEN "r_spawn" ELSE "none"
               [] ProbeState(jPend) = "stopped" /\ KillStopped -> "r_kill"
               [] OTHER -> "none"                              \* exit 75
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
 \* kill, then probe again: gone => go on; not yet reaped => exit 75
 RKill ==
     /\ rpc = "r_kill" /\ KillOrphan(jPend) /\ rpc' = "r_probe"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, calm>>
 RSpawn ==
@@ -452,61 +498,61 @@ RSpawn ==
     /\ child' = "off" /\ childPh' = "susp" /\ childId' = nextId
     /\ nextId' = IF nextId = 1 THEN 2 ELSE 1
     /\ rpc' = IF Mutation = "recordAfterResume" THEN "r_resume" ELSE "r_record"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow,
                       childRes, orphans, calm>>
 RRecord ==
-    /\ rpc = "r_record" /\ jPend' = childId /\ childPh' = "rec" /\ rpc' = "r_resume"
+    /\ rpc = "r_record" /\ jBad' = FALSE /\ jPend' = childId /\ childPh' = "rec" /\ rpc' = "r_resume"
     /\ UNCHANGED <<sd, userSet, jOwned, jSettle, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childId, childRes, nextId, orphans, calm>>
 RResume ==
     /\ rpc = "r_resume" /\ childPh' = "run"
     /\ rpc' = IF Mutation = "recordAfterResume" THEN "r_record2" ELSE "r_wait"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childId, childRes, nextId, orphans, calm>>
 RRecord2 ==
-    /\ rpc = "r_record2" /\ jPend' = childId /\ rpc' = "r_wait"
+    /\ rpc = "r_record2" /\ jBad' = FALSE /\ jPend' = childId /\ rpc' = "r_wait"
     /\ UNCHANGED <<sd, userSet, jOwned, jSettle, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
 RWait ==
     /\ rpc = "r_wait" /\ childRes # "none" /\ childRes' = "none" /\ childId' = 0
     /\ rpc' = IF childRes = "ok" THEN "r_saveOk" ELSE "r_saveFail"
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow, child,
                       childPh, nextId, orphans, calm>>
 RSaveOk ==
-    /\ rpc = "r_saveOk" /\ jPend' = 0 /\ jOwned' = FALSE /\ rpc' = "none"
+    /\ rpc = "r_saveOk" /\ jBad' = FALSE /\ jPend' = 0 /\ jOwned' = FALSE /\ rpc' = "none"
     /\ UNCHANGED <<sd, userSet, jSettle, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
 RSaveFail ==
-    /\ rpc = "r_saveFail" /\ jPend' = 0 /\ rpc' = "none"
+    /\ rpc = "r_saveFail" /\ jBad' = FALSE /\ jPend' = 0 /\ rpc' = "none"
     /\ UNCHANGED <<sd, userSet, jOwned, jSettle, pc, memOwned, memS, memPend, hold,
                       assertHeld, termPending, caller, active, battLow, child,
                       childPh, childId, childRes, nextId, orphans, calm>>
 RCrash ==
     /\ ~calm /\ rpc # "none" /\ rpc' = "none" /\ KillChild
-    /\ UNCHANGED <<sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
+    /\ UNCHANGED <<jBad, sd, userSet, jOwned, jSettle, jPend, pc, memOwned, memS, memPend,
                       hold, assertHeld, termPending, caller, active, battLow,
                       nextId, calm>>
 
 (***************************************************************************)
 (* Specification                                                           *)
 (***************************************************************************)
-DaemonStep == SLoad
+DaemonStep == SLoad \/ SQuar
     \/ Eval \/ TSaveLA \/ TProbe \/ TKill \/ TPendClear \/ TRead \/ TWal \/ TReadOwned
     \/ TAssert \/ CSpawn \/ CRecord \/ CResume \/ CRecord2 \/ CWait \/ CSave
     \/ PBegin \/ PProbe \/ PKill \/ PPendClear \/ PRelease
-RestoreStep == RLoad \/ RProbe \/ RKill \/ RSpawn \/ RRecord \/ RResume \/ RRecord2 \/ RWait
+RestoreStep == RLoad \/ RQuar \/ RProbe \/ RKill \/ RSpawn \/ RRecord \/ RResume \/ RRecord2 \/ RWait
     \/ RSaveOk \/ RSaveFail
 
 Next == DaemonStep \/ RestoreStep
     \/ ToggleActive \/ ToggleBatt \/ BecomeCalm \/ UserOn \/ UserOff \/ SigTerm
     \/ Crash \/ Restart \/ ChildOk \/ ChildFail \/ OrphanOk \/ OrphanFail \/ OrphanReap
-    \/ RStart \/ RCrash
+    \/ RStart \/ RCrash \/ Corrupt
 
 \* Liveness hypothesis: agent and restore steps are not starved, launchd
 \* restarts the agent, every resumed child (live or orphaned) eventually
@@ -529,10 +575,18 @@ NeverClobberUser == [][~(sd /\ ~sd' /\ userSet')]_vars
 \* A flag that is on against the user's intent is always backed by
 \* owned=TRUE on disk. Stronger than "no such state while crashed": it
 \* holds in every state, so no crash at any point can leak the flag.
-NoOrphanHold == (sd /\ ~userSet) => jOwned
+NoOrphanHold == (sd /\ ~userSet) => DiskOwned
 
 \* Between ticks, a running agent holds the assertion iff the last outcome held.
 AssertionIffHold == pc = "idle" => (assertHeld = hold)
 
 EventuallyRestored == <>[](sd = userSet)
+
+\* Weaker liveness that survives a corrupt journal: lidwake does not keep the
+\* Mac awake against the user's intent for good (battery and heat).
+EventuallyNoUnwantedHold == <>[](sd => userSet)
+
+\* Reachability witnesses (expected violated): the recovery paths are taken.
+NeverQuarantines == pc # "s_quar"
+RestoreNeverQuarantines == rpc # "r_quar"
 =============================================================================

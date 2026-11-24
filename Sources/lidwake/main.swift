@@ -167,8 +167,17 @@ func run(dryRun: Bool, ticks: Int?, interval: TimeInterval, stateDir: URL) throw
 
 func status(stateDir: URL) {
   let inputs = systemInputs(stateDir: stateDir).inputs()
-  let journal = JournalStore(directory: stateDir).load()
-  let outcome = Decision.evaluate(inputs, now: Date(), lastActive: journal.lastActive)
+  // nil = unreadable; the decision then uses lastActive = nil.
+  let journal: Journal? =
+    switch JournalStore(directory: stateDir).inspect() {
+    case .missing: Journal()
+    case .valid(let journal): journal
+    case .unreadable: nil
+    }
+  let journalLine =
+    journal.map(describe)
+    ?? "unreadable (the next run or restore keeps a copy and treats SleepDisabled as owned)"
+  let outcome = Decision.evaluate(inputs, now: Date(), lastActive: journal?.lastActive)
   let herdr = inputs.herdrWorking.map { $0 ? "working" : "not working" } ?? "unreachable"
   let charge = inputs.power.chargePercent.map { "\($0)%" } ?? "unknown"
   let disabled = PmsetSleepControl().isSleepDisabled().map { $0 ? "1" : "0" } ?? "unknown"
@@ -179,10 +188,24 @@ func status(stateDir: URL) {
     background task: \(inputs.backgroundTask)
     power: \(inputs.power.onBattery ? "battery" : "AC"), charge \(charge)
     SleepDisabled: \(disabled)
-    journal: owned=\(journal.owned) lastActive=\(journal.lastActive.map { "\($0)" } ?? "none") \
-    pending=\(journal.pending.map { "pid \($0.pid)" } ?? "none")
+    journal: \(journalLine)
     decision: hold=\(outcome.hold) reason=\(outcome.reason.rawValue)
     """)
+  do {
+    let kept = try JournalStore(directory: stateDir).keptUnreadableCopies()
+    if !kept.isEmpty {
+      print("kept unreadable journals: \(kept.count) (\(kept.joined(separator: ", ")))")
+    }
+  } catch {
+    log.error("cannot list kept unreadable journals: \(error, privacy: .public)")
+    FileHandle.standardError.write(
+      Data("lidwake: cannot list kept unreadable journals: \(error)\n".utf8))
+  }
+}
+
+func describe(_ journal: Journal) -> String {
+  "owned=\(journal.owned) lastActive=\(journal.lastActive.map { "\($0)" } ?? "none") "
+    + "pending=\(journal.pending.map { "pid \($0.pid)" } ?? "none")"
 }
 
 /// True once `id` is gone. A stopped child was never resumed and never ran pmset, so it is
@@ -202,6 +225,8 @@ func isGone(afterEndingStopped id: ProcessIdentity) -> Bool {
 func restore(stateDir: URL) throws {
   try lockInstance(in: stateDir)
   let store = JournalStore(directory: stateDir)
+  store.removeStaleTemporaryFiles()
+  // An unreadable journal loads as owned, so restore then clears the flag.
   var journal = store.load()
   if let pending = journal.pending, !isGone(afterEndingStopped: pending) {
     throw Busy.pmsetRunning(pid: pending.pid)

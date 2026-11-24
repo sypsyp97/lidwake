@@ -22,6 +22,9 @@ If lidwake stops unexpectedly, the next run reads the journal and keeps ownershi
 It clears the flag at the next idle check, and it keeps the ownership until `pmset -a disablesleep 0` succeeds.
 lidwake records each `pmset` child in the journal before the child runs. While a recorded child is still running, lidwake does not change the flag. A recorded child that is stopped never ran `pmset`, so lidwake kills it.
 If the flag was already `1` before lidwake needed it, lidwake does not touch it.
+If `journal.json` cannot be read, lidwake keeps a copy (`journal.json.corrupt-*`) and treats the flag as its own, so the idle and low-battery restore still work.
+At start, `run` and `restore` delete leftover `journal.json.tmp-*` files from an interrupted save.
+If the clock moves back, a last-active time in the future counts as now, so the 5-minute wait does not grow.
 
 ## Install
 
@@ -83,13 +86,16 @@ pmset -g | grep SleepDisabled   # expect 0
 - A closed MacBook in a bag can overheat while it stays awake. Do not put the Mac in a bag while lidwake holds sleep.
 - `SleepDisabled` is a system-wide setting, and it persists until a process clears it. If lidwake gets `SIGKILL` or the Mac loses power, the flag can stay set until lidwake starts again. Run `pmset -g | grep SleepDisabled` to check. Run `lidwake restore` to clear it; if the journal is gone, run `sudo pmset -a disablesleep 0`.
 - lidwake cannot tell its own `SleepDisabled=1` from a `pmset -a disablesleep 1` that you run while lidwake owns the flag. In that case, lidwake clears the flag when the work stops.
+- If `journal.json` becomes unreadable, lidwake treats the flag as its own. A `pmset -a disablesleep 1` that you set yourself can then be cleared once. `lidwake status` shows `journal: unreadable` in that state, and after recovery a `kept unreadable journals:` line that names the kept copies.
+- Run one non-dry `lidwake run` per Mac. The lock is per state directory, but `SleepDisabled` is one machine-wide flag.
 - The sudoers rule lets every process of your user toggle `SleepDisabled` without a password.
 - lidwake reads the battery state only every 30 seconds. The charge can drop below 20 % before the next check.
 
 ## Verification
 
-- `swift test`: 156 tests (Swift Testing), written test-first from `docs/SPEC.md` by a separate author from the implementation. They cover the decision rules, the herdr client (timeouts, size cap, no fd leaks), the libproc task scanner, the journal, the controller's crash-recovery rules with fakes, real child processes for the orphan guard, and the CLI as a subprocess. No test calls `sudo` or changes `SleepDisabled`.
-- `tla/`: a TLA+ model of the controller protocol, checked with TLC (`tla/check.sh`). Crashes may happen between any two steps; `pmset` may fail; the user may change the flag. Five properties hold (never undo a user setting, no unowned hold after a crash, sleep eventually restored, assertion follows hold, type safety), and ten deliberately broken variants are each caught. See `tla/README.md`.
+- `swift test`: 185 tests (Swift Testing), written test-first from `docs/SPEC.md` by a separate author from the implementation. They cover the decision rules, the herdr client (timeouts, size cap, no fd leaks), the libproc task scanner, the journal, the controller's crash-recovery rules with fakes, real child processes for the orphan guard, and the CLI as a subprocess. No test calls `sudo` or changes `SleepDisabled`.
+- `tla/`: a TLA+ model of the controller protocol, checked with TLC (`tla/check.sh`). Crashes may happen between any two steps; `pmset` may fail; the user may change the flag. Six properties hold (never undo a user setting, no unowned hold after a crash, sleep eventually restored, no unwanted hold in the end, assertion follows hold, type safety), and ten deliberately broken variants are each caught. A second group lets `journal.json` become unreadable: no unowned hold and "no unwanted hold in the end" still hold, and the old rule (load as not owned) is caught. See `tla/README.md`.
+- `.claude/skills/verify-lidwake/`: how to drive the built CLI on isolated state (doctor, feature map, journeys) without touching the installed agent.
 - `leaks --atExit -- lidwake run --dry-run --ticks 20 --interval 0.05` reports 0 leaks.
 
 ## License

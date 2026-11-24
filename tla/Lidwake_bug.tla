@@ -14,6 +14,9 @@
 (*                       killed                          -> EventuallyRestored *)
 (*   "noAssertOnFail"    failed enable skips assertion   -> AssertionIffHold *)
 (*   "typeOverflow"      settle counter set to S+1       -> TypeOK          *)
+(*   "corruptAsUnowned"  unreadable journal loaded as    *)
+(*                       Journal() (rule before rev. 5)  -> NoOrphanHold,   *)
+(*                                                   EventuallyNoUnwantedHold *)
 (* check.sh generates one cfg per bug; Lidwake_bug.cfg is the first one.  *)
 (***************************************************************************)
 EXTENDS Lidwake

@@ -40,7 +40,7 @@ extension LidwakeTests {
             private let outURL: URL
             private let errURL: URL
 
-            init(_ args: [String], stateDir: URL) throws {
+            init(_ args: [String], stateDir: URL, environment: [String: String] = [:]) throws {
                 self.stateDir = stateDir
                 let logs = try TempPaths.makeDirectory("cli-logs")
                 outURL = logs.appendingPathComponent("stdout")
@@ -51,7 +51,7 @@ extension LidwakeTests {
                 process.arguments = args
                 let home = logs.appendingPathComponent("home", isDirectory: true)
                 try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
-                var env = ProcessInfo.processInfo.environment
+                var env = ProcessInfo.processInfo.environment.merging(environment) { _, override in override }
                 env["LIDWAKE_STATE_DIR"] = stateDir.path
                 // macOS takes NSHomeDirectory()/homeDirectoryForCurrentUser from CFFIXED_USER_HOME, not HOME.
                 env["HOME"] = home.path

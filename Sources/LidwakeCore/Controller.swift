@@ -35,8 +35,9 @@ public final class Controller {
 
   /// Reloads the journal of a previous process. Ownership survives the restart: only a
   /// successful `setSleepDisabled(false)` drops it, because a crashed run's pmset child
-  /// may still change the flag.
+  /// may still change the flag. An unreadable journal loads as owned (`JournalStore.load`).
   public func start(now: Date) {
+    store.removeStaleTemporaryFiles()
     journal = store.load()
     saved = journal
   }

@@ -20,6 +20,7 @@ Each property is also checked in its own TLC run, so one violation does not hide
 | `sd` | System flag `SleepDisabled` |
 | `userSet` | The user's intent: the value of the last manual `pmset disablesleep` |
 | `jOwned`, `jSettle`, `jPend` | `journal.json` on disk: `owned`, `lastActive` as remaining settle ticks, `pending` child identity (0 = nil) |
+| `jBad` | `journal.json` cannot be read or decoded. Every save replaces it. |
 | `pc`, `memOwned`, `memS`, `memPend`, `hold`, `caller` | Agent process: program counter, in-memory journal, last `Outcome.hold`, which step is inside `setSleepDisabled` |
 | `assertHeld` | Power assertion held by the agent |
 | `termPending` | SIGTERM/SIGINT received, `stop()` not yet run |
@@ -44,14 +45,14 @@ A crash before step 2 leaves a stopped child with no flag effect that nothing pr
 
 Agent steps, each atomic:
 
-- `start()`: load the journal (owned, `lastActive`, pending). No flag read, no save, no pmset call.
+- `start()`: load the journal (owned, `lastActive`, pending). No flag read, no save, no pmset call. Unreadable journal (revision 5): load as owned, then one save of `owned=true, pending=nil` (`s_quar`; the copy of the bad bytes has no model effect).
 - `tick()`: evaluate → save `lastActive` → orphan guard → branch on (`hold`, `owned`) → set the assertion to `hold`.
   - Orphan guard: if `pending != nil`, probe. `stopped` → kill it, no `setSleepDisabled` call this tick. `running` → no call this tick. `gone` → save `pending = nil`, then branch.
   - `hold && !owned`: read flag. `true` or nil → no claim. `false` → write-ahead save `owned=true` → call `pmset 1` → on failure `owned=false`.
   - `hold && owned`: read flag. `false` → call `pmset 1` (owned stays true). `true` or nil → no call.
   - `!hold && owned`: call `pmset 0` (no read) → on success `owned=false`.
 - `stop()`: if owned: orphan guard (`stopped` → kill; not `gone` → no call, owned stays true) → call `pmset 0` → on success `owned=false` → release assertion → exit.
-- `restore`: load journal → probe pending. `stopped` → kill, probe again. Not `gone` → exit 75, nothing changed. `gone` and owned → call `pmset 0` → success `owned=false`.
+- `restore`: load journal (unreadable → save `owned=true` (`r_quar`) → call `pmset 0`) → probe pending. `stopped` → kill, probe again. Not `gone` → exit 75, nothing changed. `gone` and owned → call `pmset 0` → success `owned=false`.
 
 The model always allows these environment events, between any two steps:
 
@@ -61,6 +62,7 @@ The model always allows these environment events, between any two steps:
 - a nil result from `isSleepDisabled()`;
 - SIGTERM, input changes, and `pmset disablesleep 0` by the user;
 - `pmset disablesleep 1` by the user, but only while lidwake has no claim on the flag (`UserRace = FALSE`).
+- `journal.json` becomes unreadable (`Corruption = TRUE` only): not while `restore` runs (restore keeps its loaded journal in memory and its next save overwrites the disk, so this acts like a corruption right after restore ends), and in the `corrupt` group only while no child is recorded (`CorruptWithPending = FALSE`).
 
 launchd `KeepAlive` restarts the agent; a restart runs `start()`.
 
@@ -87,6 +89,10 @@ launchd `KeepAlive` restarts the agent; a restart runs `start()`.
 | `AssertionIffHold` | invariant | Between ticks, the agent holds the assertion iff the last outcome had `hold = true` |
 | `NeverClobberUser` | action | `[][~(sd /\ ~sd' /\ userSet')]_vars`: lidwake never turns the flag off while the user's intent is on |
 | `EventuallyRestored` | temporal | `<>[](sd = userSet)` under the fairness and `calm` hypothesis |
+| `EventuallyNoUnwantedHold` | temporal | `<>[](sd => userSet)`: lidwake does not keep the Mac awake against the user's intent for good. Weaker than `EventuallyRestored`; it is the promise that survives a corrupt journal. |
+| `NeverQuarantines`, `RestoreNeverQuarantines` | invariant | Reachability witnesses, expected violated: the recovery steps `s_quar` and `r_quar` are reached, so the `corrupt` results are not vacuous. |
+
+`NoOrphanHold` reads the disk through `DiskOwned`: an unreadable journal counts as owned under revision 5 (what the next load concludes), as not owned under the old rule.
 
 ## Constants
 
@@ -94,6 +100,8 @@ launchd `KeepAlive` restarts the agent; a restart runs `start()`.
 |---|---|
 | `UserRace` | TRUE: the user can run `pmset disablesleep 1` at any instant. FALSE (base): only while lidwake has no claim (`Quiet`: journal not owned, no child, no orphan, no `restore` running). SPEC §8 accepts the TRUE case as a known limitation. |
 | `Mutation` | `"none"` or one seeded bug (`Lidwake_bug.tla`) |
+| `Corruption` | TRUE: `journal.json` can become unreadable. FALSE in the base, mutation and limitation groups, so those behave as before revision 5. |
+| `CorruptWithPending` | TRUE: the corruption can also strike while a child is recorded. Only in `corrupt-limitation-pending`. |
 
 ## Results (TLC 2026.09.23, 18 workers, 2026-11-06, Spec revision 4)
 
@@ -138,3 +146,20 @@ TLC runs with 18 workers, so the state counts of violated runs and the reported 
 - Spec revision 2: closed four, documented the user race. The model then found that an orphaned `pmset 1` can land after a later successful `pmset 0` (through tick, `stop` and `restore`).
 - Spec revision 3: orphan guard (record the child before it runs, no `setSleepDisabled` call while it is alive). All properties hold under the assumption that every orphan eventually exits. A child recorded but not resumed stays stopped, so that assumption can fail.
 - Spec revision 4: kill a stopped pending child. The model drops the assumption for stopped orphans; all properties hold.
+- Spec revision 5 (2026-11-24, hidden-state review): an unreadable journal used to load as `Journal()`. The next save then wrote `owned=false`, and a flag lidwake had set stayed on for good, with the low-battery restore lost. `corrupt-bug-corruptAsUnowned` shows it (`NoOrphanHold`, `EventuallyNoUnwantedHold`). Revision 5 keeps a copy of the bad file and loads it as owned. Trade-off, by design: `NeverClobberUser` and `EventuallyRestored` fail under corruption, because a user's own `1` can be cleared once.
+
+## Results, revision 5 (TLC 2026.09.23, `FULL_SUITE_OK=1 ./check.sh`, 2026-11-24)
+
+All 34 runs give the expected result (exit 0, 35 s): 7 base, 10 mutations, 6 limitation, 11 corrupt. The base group is unchanged: 427000 states generated, 82920 distinct, depth 49, as in revision 4.
+
+| Run | Expected | States (distinct) | Depth |
+|---|---|---|---|
+| `corrupt/TypeOK`, `NoOrphanHold`, `AssertionIffHold`, `EventuallyNoUnwantedHold` | hold | 237456 | 57 |
+| `corrupt/NeverClobberUser` | violated (trade-off) | 2505 | 12 |
+| `corrupt/EventuallyRestored` | violated (trade-off) | 237456 | 57 |
+| `corrupt-bug-corruptAsUnowned/NoOrphanHold` | violated | 3751 | 15 |
+| `corrupt-bug-corruptAsUnowned/EventuallyNoUnwantedHold` | violated | 101976 | 50 |
+| `corrupt-reach/NeverQuarantines`, `RestoreNeverQuarantines` | violated (witness) | 391, 605 | 7, 8 |
+| `corrupt-limitation-pending/NoOrphanHold` | violated (limitation) | 84448 | 22 |
+
+Not modelled: the wall clock (`Decision` is pure; rule 0 is checked by property tests), `journal.json.tmp-*` files (one writer under the instance lock; checked by a crash-then-restart test), and two agents with different state directories (not supported, SPEC §9).

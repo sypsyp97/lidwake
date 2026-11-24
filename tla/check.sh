@@ -6,11 +6,19 @@
 #
 # Groups (each property is checked in its own TLC run, so one violation
 # does not hide another):
-#   base        Lidwake.cfg (SPEC 2b0ce82, UserRace = FALSE): every property must hold
+#   base        Lidwake.cfg (SPEC revision 5, UserRace = FALSE, journal always
+#               readable): every property must hold
 #   mutation    base + one seeded bug: the targeted property must be violated
 #   limitation  base + UserRace = TRUE (SPEC 8 "Known limitation"):
 #               NeverClobberUser and EventuallyRestored are expected to fail,
 #               the other properties must hold
+#   corrupt     base + Corruption = TRUE (journal.json can become unreadable):
+#               the safety invariants and EventuallyNoUnwantedHold must hold;
+#               NeverClobberUser and EventuallyRestored fail by design (an
+#               unreadable journal is loaded as owned, so a user's own 1 can be
+#               cleared); the old rule (corruptAsUnowned) must fail; the
+#               recovery paths must be reachable; a corruption while a pmset
+#               child is recorded (CorruptWithPending) is a known limitation
 # Exit status is 0 only when every run gives its expected result.
 set -u
 cd "$(dirname "$0")"
@@ -31,10 +39,10 @@ done
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/lidwake-tla.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 INVARIANTS="TypeOK NoOrphanHold AssertionIffHold"
-PROPERTIES="NeverClobberUser EventuallyRestored"
+PROPERTIES="NeverClobberUser EventuallyRestored EventuallyNoUnwantedHold"
 status=0
 
-# mkcfg FILE USERRACE MUTATION PROPERTY
+# mkcfg FILE USERRACE MUTATION PROPERTY [CORRUPTION [CORRUPT_WITH_PENDING]]
 mkcfg() {
   {
     echo "SPECIFICATION Spec"
@@ -42,7 +50,9 @@ mkcfg() {
     echo "    S = 2"
     echo "    UserRace = $2"
     echo "    Mutation = \"$3\""
-    case " $INVARIANTS " in
+    echo "    Corruption = ${5:-FALSE}"
+    echo "    CorruptWithPending = ${6:-FALSE}"
+    case " $INVARIANTS NeverQuarantines RestoreNeverQuarantines " in
       *" $4 "*) echo "INVARIANTS $4" ;;
       *) echo "PROPERTIES $4" ;;
     esac
@@ -103,5 +113,22 @@ for p in $INVARIANTS $PROPERTIES; do
   mkcfg "$TMP/lim-$p.cfg" TRUE none "$p"
   run "limitation/$p" Lidwake "$TMP/lim-$p.cfg" "$e" "$p"
 done
+
+echo "== corrupt (journal.json can become unreadable)"
+for p in $INVARIANTS $PROPERTIES; do
+  case "$p" in NeverClobberUser|EventuallyRestored) e=fail ;; *) e=pass ;; esac
+  mkcfg "$TMP/cor-$p.cfg" FALSE none "$p" TRUE
+  run "corrupt/$p" Lidwake "$TMP/cor-$p.cfg" "$e" "$p"
+done
+for p in NoOrphanHold EventuallyNoUnwantedHold; do
+  mkcfg "$TMP/cor-old-$p.cfg" FALSE corruptAsUnowned "$p" TRUE
+  run "corrupt-bug-corruptAsUnowned/$p" Lidwake_bug "$TMP/cor-old-$p.cfg" fail "$p"
+done
+for p in NeverQuarantines RestoreNeverQuarantines; do
+  mkcfg "$TMP/cor-reach-$p.cfg" FALSE none "$p" TRUE
+  run "corrupt-reach/$p" Lidwake "$TMP/cor-reach-$p.cfg" fail "$p"
+done
+mkcfg "$TMP/cor-pend.cfg" FALSE none NoOrphanHold TRUE TRUE
+run "corrupt-limitation-pending/NoOrphanHold" Lidwake "$TMP/cor-pend.cfg" fail NoOrphanHold
 
 exit $status
